@@ -1,0 +1,139 @@
+diff -Naur iscsi-scst/kernel/conn.c iscsi-scst/kernel/conn.c
+--- iscsi-scst/kernel/conn.c	2020-09-20 01:01:11.309636090 +0800
++++ iscsi-scst/kernel/conn.c	2021-09-02 20:00:34.916634627 +0800
+@@ -434,8 +434,10 @@
+ 
+ 	if (unlikely(sk->sk_state != TCP_ESTABLISHED)) {
+ 		if (!conn->closing) {
+-			PRINT_ERROR("Connection %p with initiator %s unexpectedly closed!",
+-				    conn, conn->session->initiator_name);
++/*			PRINT_ERROR("Connection %p with initiator %s unexpectedly closed!",
++				    conn, conn->session->initiator_name); */
++			PRINT_INFO("BNB-iscsi: Connection with TGT IP %s closed!\n",
++					conn->session->target->name);
+ 			TRACE_MGMT_DBG("conn %p, sk state %d", conn,
+ 				sk->sk_state);
+ 			__mark_conn_closed(conn, 0);
+@@ -538,9 +540,10 @@
+ 
+ 		if (unlikely(time_after_eq(j, iscsi_get_timeout_time(cmnd)))) {
+ 			if (!conn->closing) {
+-				PRINT_ERROR("Timeout %ld sec sending data/waiting for reply to/from initiator %s (SID %llx), closing connection %p",
++                               /* BNB_TGT KERNEL PRINT INFO Timeout */
++				PRINT_INFO("Timeout %ld sec sending data/waiting for reply to/from initiator %s (SID %llx), closing connection %p",
+ 					iscsi_get_timeout(cmnd)/HZ,
+-					conn->session->initiator_name,
++					conn->session->target->name,
+ 					(unsigned long long)conn->session->sid,
+ 					conn);
+ 				/*
+diff -Naur iscsi-scst/usr/iscsid.c iscsi-scst/usr/iscsid.c
+--- iscsi-scst/usr/iscsid.c	2020-09-16 22:10:25.940206755 +0800
++++ iscsi-scst/usr/iscsid.c	2021-09-02 19:44:42.726519324 +0800
+@@ -23,6 +23,7 @@
+ #include <netinet/in.h>
+ #include <arpa/inet.h>
+ #include <netdb.h>
++#include <unistd.h>
+ 
+ #include "iscsid.h"
+ 
+@@ -498,10 +499,53 @@
+ 	return res;
+ }
+ 
++/* HC-Diskless get client login ip address */
++int get_ip(int fd,char* buf,int buf_len)
++{
++        struct sockaddr_storage ss;
++        socklen_t slen, blen;
++        char *p;
++
++        if( buf_len < NI_MAXHOST )
++                return -1;
++        p = buf;
++        blen = buf_len;
++
++        slen = sizeof(ss);
++
++        getpeername(fd, (struct sockaddr *) &ss, &slen);
++                if (ss.ss_family == AF_INET6) {
++                        *p++ = '[';
++                        blen--;
++                }
++        slen = sizeof(ss);
++        getnameinfo((struct sockaddr *) &ss, slen, p, blen,NULL, 0, NI_NUMERICHOST);
++        return 0;
++}
++
+ static void login_start(struct connection *conn)
+ {
+ 	struct iscsi_login_req_hdr *req = (struct iscsi_login_req_hdr *)&conn->req.bhs;
+ 	char *name, *session_type, *target_name;
++        char tgt_ip[NI_MAXHOST];
++        char tgt_run[2048];
++        char tgt_update_ip[2048];
++        char tgt_update_targets[2048] = "tgt-update-targets";
++
++        get_ip(conn->fd,tgt_ip,sizeof(tgt_ip));				/* 获取要登陆客户端IP地址函数 */
++        sprintf(tgt_update_ip,"/usr/local/app/update/%s",tgt_ip);
++
++        if (access(tgt_update_ip,0) != 0) {
++                if (target_find_by_id(conn->tid) == NULL) {
++                config_target_create(&(conn->tid), tgt_ip);
++                }
++                sprintf(tgt_run,"sudo /usr/local/sbin/tgt-mk %s", tgt_ip);
++                system(tgt_run);
++        }else{
++                if (target_find_by_id(conn->tid) == NULL) {
++                config_target_create(&(conn->tid), tgt_update_targets);
++                }
++	}
+ 
+ 	conn->cid = be16_to_cpu(req->cid);
+ 	conn->sid.id64 = req->sid.id64;
+diff -Naur iscsi-scst/usr/session.c iscsi-scst/usr/session.c
+--- iscsi-scst/usr/session.c	2019-05-06 00:58:26.552941861 +0800
++++ iscsi-scst/usr/session.c	2021-09-02 19:44:42.726519324 +0800
+@@ -170,6 +170,11 @@
+ 
+ void session_free(struct session *session)
+ {
++        char super_id[2048];
++        char free_cmd[2048];
++//      char id[2048];
++//      sprintf(target_id,"%s",session->target->name);
++	sprintf(super_id,"/usr/local/app/super/%s",session->target->name);
+ 	log_debug(1, "Freeing session sid %#"PRIx64, session->sid.id64);
+ 
+ 	if (session->target) {
+@@ -186,6 +191,17 @@
+ 
+ 	free(session->initiator);
+ 	free(session);
++
++        if (strcmp(session->target->name,"tgt-update-targets") != 0) {
++            if (access(super_id,0) != 0) {
++                        sprintf(free_cmd,"sudo /usr/local/sbin/tgt-del %s",session->target->name);
++                        system(free_cmd);
++//                      sprintf(id,"sudo echo %s >/tmp/a",super_id);
++//                      system(id);
++//                      config_target_destroy(session->target->tid);
++                }
++        }
++
+ 	return;
+ }
+ 
+diff -Naur iscsi-scst/usr/target.c iscsi-scst/usr/target.c
+--- iscsi-scst/usr/target.c	2019-05-26 20:01:44.998263902 +0800
++++ iscsi-scst/usr/target.c	2021-09-02 19:44:42.726519324 +0800
+@@ -450,7 +450,7 @@
+ 
+ 	list_add_tail(&target->tlist, &targets_list);
+ 
+-
++	target->tgt_enabled = 1;		/* targets tgt_enabled on */
+ out:
+ 	return err;
+ }
